@@ -1,43 +1,33 @@
 import re
-from functools import partial
-
 import numpy as np
 import torch
-
+from functools import partial
 from modules import RoPE, shared
 from modules.callbacks import Iteratorize
 from modules.logging_colors import logger
 from modules.text_generation import get_max_prompt_length
-
 import llama_cpp
 
+# Importa llama_cpp_cuda solo se è disponibile CUDA
 if torch.cuda.is_available() and not torch.version.hip:
     try:
         import llama_cpp_cuda
-    except:
+    except ImportError:
         llama_cpp_cuda = None
 else:
     llama_cpp_cuda = None
 
-
 def llama_cpp_lib():
-    if shared.args.cpu or llama_cpp_cuda is None:
-        return llama_cpp
-    else:
-        return llama_cpp_cuda
-
+    return llama_cpp_cuda if not shared.args.cpu or llama_cpp_cuda is not None else llama_cpp
 
 def ban_eos_logits_processor(eos_token, input_ids, logits):
     logits[eos_token] = -float('inf')
     return logits
 
-
 def custom_token_ban_logits_processor(token_ids, input_ids, logits):
     for token_id in token_ids:
         logits[token_id] = -float('inf')
-
     return logits
-
 
 class LlamaCppModel:
     def __init__(self):
@@ -47,27 +37,15 @@ class LlamaCppModel:
         self.model.__del__()
 
     @classmethod
-    def from_pretrained(self, path):
-
+    def from_pretrained(cls, path):
         Llama = llama_cpp_lib().Llama
         LlamaCache = llama_cpp_lib().LlamaCache
 
-        result = self()
-        cache_capacity = 0
-        if shared.args.cache_capacity is not None:
-            if 'GiB' in shared.args.cache_capacity:
-                cache_capacity = int(re.sub('[a-zA-Z]', '', shared.args.cache_capacity)) * 1000 * 1000 * 1000
-            elif 'MiB' in shared.args.cache_capacity:
-                cache_capacity = int(re.sub('[a-zA-Z]', '', shared.args.cache_capacity)) * 1000 * 1000
-            else:
-                cache_capacity = int(shared.args.cache_capacity)
+        result = cls()
+        cache_capacity = get_cache_capacity(shared.args.cache_capacity)
+        logger.info(f"Cache capacity is {cache_capacity} bytes")
 
-        logger.info("Cache capacity is " + str(cache_capacity) + " bytes")
-
-        if shared.args.tensor_split is None or shared.args.tensor_split.strip() == '':
-            tensor_split_list = None
-        else:
-            tensor_split_list = [float(x) for x in shared.args.tensor_split.strip().split(",")]
+        tensor_split_list = get_tensor_split_list(shared.args.tensor_split)
 
         params = {
             'model_path': str(path),
@@ -88,14 +66,12 @@ class LlamaCppModel:
         result.model = Llama(**params)
         if cache_capacity > 0:
             result.model.set_cache(LlamaCache(capacity_bytes=cache_capacity))
-
-        # This is ugly, but the model and the tokenizer are the same object in this library.
+		# This is ugly, but the model and the tokenizer are the same object in this library.
         return result, result
 
     def encode(self, string):
-        if type(string) is str:
+        if isinstance(string, str):
             string = string.encode()
-
         return self.model.tokenize(string)
 
     def decode(self, ids):
@@ -108,23 +84,20 @@ class LlamaCppModel:
         return torch.tensor(logits, dtype=torch.float32)
 
     def generate(self, prompt, state, callback=None):
-
         LogitsProcessorList = llama_cpp_lib().LogitsProcessorList
-
-        prompt = prompt if type(prompt) is str else prompt.decode()
+        prompt = prompt if isinstance(prompt, str) else prompt.decode()
 
         # Handle truncation
         prompt = self.encode(prompt)
         prompt = prompt[-get_max_prompt_length(state):]
         prompt = self.decode(prompt)
-
         logit_processors = LogitsProcessorList()
         if state['ban_eos_token']:
-            logit_processors.append(partial(ban_eos_logits_processor, self.model.tokenizer.eos_token_id))
+            logit_processors.append(partial(ban_eos_logits_processor, self.model.tokenizer.()))
 
         if state['custom_token_bans']:
             to_ban = [int(x) for x in state['custom_token_bans'].split(',')]
-            if len(to_ban) > 0:
+            if to_ban:
                 logit_processors.append(partial(custom_token_ban_logits_processor, to_ban))
 
         completion_chunks = self.model.create_completion(
@@ -159,3 +132,19 @@ class LlamaCppModel:
             for token in generator:
                 reply += token
                 yield reply
+
+def get_cache_capacity(cache_capacity):
+    if not cache_capacity:
+        return 0
+    if 'GiB' in cache_capacity:
+        return int(re.sub('[a-zA-Z]', '', cache_capacity)) * 1000 * 1000 * 1000
+    elif 'MiB' in cache_capacity:
+        return int(re.sub('[a-zA-Z]', '', cache_capacity)) * 1000 * 1000
+    else:
+        return int(cache_capacity)
+
+def get_tensor_split_list(tensor_split):
+    if not tensor_split or tensor_split.strip() == '':
+        return None
+    return [float(x) for x in tensor_split.strip().split(",")]
+
